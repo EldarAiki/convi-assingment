@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Runtime outputs (keep directory placeholders)
+**/output/*
+!**/output/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp

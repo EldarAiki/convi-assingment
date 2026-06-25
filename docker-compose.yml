@@ -1,0 +1,31 @@
+# Headless Neo4j — alternative to Neo4j Desktop (requires Docker only).
+#
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f neo4j
+#
+# Then set in assignment/.env:
+#   NEO4J_URI=bolt://localhost:7687
+#   NEO4J_USER=neo4j
+#   NEO4J_PASSWORD=convi-dev-password
+#   NEO4J_DATABASE=neo4j
+
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: convi-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/convi-dev-password
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "convi-dev-password", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  neo4j_data:

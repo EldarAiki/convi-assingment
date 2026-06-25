@@ -1,0 +1,452 @@
+# Graph schema for Convi injury-claims platform
+# Purpose: enable AI agents to reason about cases, draw conclusions,
+# and find structurally and narratively similar cases for a legal firm.
+
+schemaVersion: "1.2"
+targetGraph: neo4j
+
+goal: |
+  Provide a lightweight, case-centric graph where an AI agent can:
+  - reconstruct case timeline from dated edges (document receipt, communications, milestones)
+  - compare cases by type, legal stage, injury context, and outcomes
+  - read distilled narrative text without loading raw MongoDB/OCR blobs
+  - traverse parties, documents, and financial/legal analysis
+
+# ---------------------------------------------------------------------------
+# Design philosophy (v1.1)
+# ---------------------------------------------------------------------------
+# Prefer edges over nodes for events/interactions to avoid duplication and
+# reduce graph weight (~8k event nodes → dated relationships).
+#
+# Nodes hold canonical entities + stable narrative (File OCR summary,
+# FinancialProjection caseSummary).
+# Edges hold timeline/interaction data (when something happened + short summary).
+#
+# Source selection rules:
+#   - communications collection  → COMMUNICATED edges (Case → Party)
+#   - case_activity_log category=document → RECEIVED_DOCUMENT edges (Case → File)
+#   - case_activity_log category=communication → EXCLUDED (redundant with COMMUNICATED)
+#   - other activity_log categories → ACTIVITY edges (Case → Party)
+#
+# Linking rules (from data analysis):
+#   - document activities: use details.fileId → files._id (NOT entityId alone)
+#   - entityId for documents is usually "file_" + details.fileId
+#   - communication activities are NOT ingested; communications table is source of truth
+
+versions:
+  v1:
+    scope: operational_graph
+    schemaVersion: "1.2"
+    mongoCollections:
+      - cases
+      - contacts
+      - files
+      - communications
+      - case_activity_log
+      - case_financial_projections
+    excludedCollections:
+      - messages
+      - conversations
+    activityLogIngest:
+      includeCategories:
+        - document
+        - reminder
+        - instruction
+        - signing
+        - case_info
+        - status_change
+        - contact
+        - partner
+        - pipeline
+        - note
+      excludeCategories:
+        - communication
+        # conversation summaries optional; excluded in v1 to keep graph lean
+        - conversation
+    narrativeSources:
+      - case_activity_log.summary          # on RECEIVED_DOCUMENT and ACTIVITY edges
+      - case_financial_projections.projection.caseSummary  # on FinancialProjection node
+      - files.processedData.ocr_metadata.summary           # on File node
+
+  v2:
+    scope: intelligence_graph
+    adds:
+      - vectorEmbeddings on edge/node narrative fields
+      - SIMILAR_TO edges between cases
+      - partyIdentityResolution across cases
+      - optional Organization nodes from summaries
+
+# ---------------------------------------------------------------------------
+# Nodes (canonical entities only)
+# ---------------------------------------------------------------------------
+nodes:
+  Case:
+    description: Central hub for an injury claim / legal matter.
+    mongoSource:
+      collection: cases
+      idField: caseId
+    properties:
+      caseId: { type: string, required: true, unique: true }
+      mongoId: { type: string, source: _id }
+      caseType: { type: string, source: caseType }
+      caseName: { type: string, source: caseName }
+      appStatus: { type: string, source: status, note: "operational workflow status" }
+      appStage: { type: string, source: stage, note: "operational workflow stage" }
+      eventDate: { type: datetime, source: eventDate, note: "incident date when known" }
+      injuredBodyParts:
+        type: array
+        items: string
+        source: medicalInfo.injuredBodyParts
+        optional: true
+        note: "Structured body-part injuries from case intake; often empty"
+      mainInjury:
+        type: string
+        source: projection.caseData.mainInjury
+        denormalizedFrom: case_financial_projections
+        optional: true
+        note: "Primary injury narrative from current projection analysis"
+      injurySearchText:
+        type: string
+        derived: true
+        optional: true
+        note: "Combined mainInjury + injuredBodyParts + event/damage descriptions for agent search"
+      hmo: { type: string, source: medicalInfo.hmo, optional: true }
+      eventDescription: { type: string, source: eventDescription, optional: true }
+      damageDescription: { type: string, source: damageDescription, optional: true }
+      fileCount: { type: int, source: documentCount, optional: true }
+      searchDigest: { type: string, derived: true, optional: true, note: "Short agent digest from projection + caseType; max ~500 chars" }
+
+  Party:
+    description: Person or organization involved in a case.
+    mongoSources:
+      - collection: cases
+        via: clientInfo
+        idField: clientId
+      - collection: contacts
+        idField: userId
+    properties:
+      partyId: { type: string, required: true, unique: true }
+      partyKind: { type: enum, values: [person, organization] }
+      roleType: { type: string, examples: [client, lawyer, doctor, family, owner, admin, insurer, expert] }
+      name: { type: string }
+      firstName: { type: string, optional: true }
+      lastName: { type: string, optional: true }
+      phone: { type: string, optional: true }
+      email: { type: string, optional: true }
+      idNumber: { type: string, optional: true }
+      organizationName: { type: string, optional: true }
+      contactType: { type: string, source: contacts.contactType, optional: true }
+      mongoContactId: { type: string, optional: true }
+
+  File:
+    description: |
+      Document attached to a case. Canonical document content/metadata.
+      Linked to Case via RECEIVED_DOCUMENT edge (from activity_log), not a bare HAS_FILE node.
+    mongoSource:
+      collection: files
+      idField: _id
+    properties:
+      fileId: { type: string, required: true, unique: true, source: _id }
+      caseId: { type: string, required: true, note: "denormalized for ingest validation only" }
+      fileName: { type: string }
+      fileType: { type: string, optional: true }
+      documentType: { type: string, source: processedData.document_type, optional: true }
+      documentCategory: { type: string, source: processedData.document_category, optional: true }
+      documentDate: { type: string, source: processedData.document_date, optional: true }
+      summaryShort: { type: string, source: processedData.ocr_metadata.summary, note: "OCR narrative for agent" }
+      processingStatus: { type: string, optional: true }
+      gcsPath: { type: string, optional: true }
+      textLength: { type: int, derived: true, optional: true }
+
+  FinancialProjection:
+    description: |
+      Current legal/financial analysis snapshot for a case.
+      Holds case-level narrative (projection.caseSummary) and legal stage.
+    mongoSource:
+      collection: case_financial_projections
+      filter: { status: current }
+      idField: _id
+    properties:
+      projectionId: { type: string, required: true, unique: true, source: _id }
+      caseId: { type: string, required: true }
+      version: { type: int }
+      status: { type: string }
+      caseSummary: { type: string, source: projection.caseSummary, note: "Primary legal case narrative" }
+      analysisDate: { type: string, source: projection.analysisDate, optional: true }
+      legalStage: { type: string, source: projection.caseStage.currentStage, optional: true }
+      legalStageHebrew: { type: string, source: projection.caseStage.currentStageHebrew, optional: true }
+      stageNumber: { type: int, source: projection.caseStage.stageNumber, optional: true }
+      daysInCurrentStage: { type: int, source: projection.caseStage.daysInCurrentStage, optional: true }
+      slaStatus: { type: string, source: projection.caseStage.slaStatus, optional: true }
+      classificationCategory: { type: string, source: projection.classification.category, optional: true }
+      classifiedCaseType: { type: string, source: projection.classification.classifiedCaseType, optional: true }
+      classificationConfidence: { type: string, source: projection.classification.confidence, optional: true }
+      accidentDate: { type: string, source: projection.keyDates.accidentDate, optional: true }
+      disabilityDeterminationDate: { type: string, source: projection.keyDates.disabilityDetermination, optional: true }
+      caseOpenedDate: { type: string, source: projection.keyDates.caseOpened, optional: true }
+      firstInsuranceContactDate: { type: string, source: projection.keyDates.firstInsuranceContact, optional: true }
+      estimatedCompensation: { type: number, source: projection.financials.estimatedCompensation, optional: true }
+      feePercentage: { type: number, source: projection.financials.feePercentage, optional: true }
+      mainInjury: { type: string, source: projection.caseData.mainInjury, optional: true }
+      occupation: { type: string, source: projection.caseData.occupation, optional: true }
+      claimNumber: { type: string, source: projection.caseData.claimNumber, optional: true }
+      clientName: { type: string, source: projection.clientName, optional: true }
+      generatedAt: { type: datetime, source: metadata.generatedAt, optional: true }
+
+# ---------------------------------------------------------------------------
+# Edges (events and relationships)
+# ---------------------------------------------------------------------------
+edges:
+  HAS_PARTY:
+    description: Case involves a person or organization.
+    from: Case
+    to: Party
+    mongoSources:
+      - collection: cases
+        via: clientInfo
+      - collection: contacts
+        via: caseIds
+    properties:
+      role: { type: string, examples: [client, contact, lawyer, doctor] }
+      source: { type: string, note: "cases | contacts" }
+
+  HAS_PROJECTION:
+    description: Case has a current financial/legal projection snapshot.
+    from: Case
+    to: FinancialProjection
+    mongoSource:
+      collection: case_financial_projections
+      filter: { status: current }
+    properties:
+      isCurrent: { type: boolean, default: true }
+
+  RECEIVED_DOCUMENT:
+    description: |
+      Case received a document at a point in time.
+      Sourced from case_activity_log where category=document.
+      This is the primary Case → File link (replaces bare HAS_FILE + ActivityEvent node).
+    from: Case
+    to: File
+    mongoSource:
+      collection: case_activity_log
+      filter: { category: document }
+      linkField: details.fileId
+      linkTarget: files._id
+    properties:
+      activityId: { type: string, source: _id, note: "activity_log record id for provenance" }
+      action: { type: string, source: action, examples: [file_uploaded, document_generated, email_documents_received] }
+      summary: { type: string, source: summary, note: "Timeline narrative for when/how document arrived" }
+      timestamp: { type: datetime, source: timestamp, note: "When document was received/uploaded" }
+      userId: { type: string, optional: true }
+      userName: { type: string, optional: true }
+      source: { type: string, optional: true }
+
+  COMMUNICATED:
+    description: |
+      Formal correspondence between case and party (email, WhatsApp, voice).
+      Sourced from communications collection only.
+      case_activity_log category=communication is intentionally excluded.
+    from: Case
+    to: Party
+    mongoSource:
+      collection: communications
+    partyResolution:
+      - match communications.userId to Party.partyId
+      - fallback communications.from / to names when userId unavailable
+    properties:
+      communicationId: { type: string, source: communicationId, required: true }
+      mongoId: { type: string, source: _id }
+      type: { type: enum, values: [email, whatsapp, voice] }
+      direction: { type: string, examples: [incoming, outgoing] }
+      bodyPreview: { type: string, source: bodyText, maxLength: 500 }
+      status: { type: string, optional: true }
+      sentAt: { type: datetime, source: sentAt }
+      fromName: { type: string, source: from.name, optional: true }
+      fromPhone: { type: string, source: from.phone, optional: true }
+      summary: { type: string, derived: true, optional: true, note: "Optional short summary; primary text is bodyPreview" }
+
+  ACTIVITY:
+    description: |
+      Non-document, non-communication milestone from case_activity_log.
+      Covers reminders, instructions, signing, status changes, etc.
+    from: Case
+    to: Party
+    mongoSource:
+      collection: case_activity_log
+      excludeCategories: [document, communication, conversation]
+    partyResolution:
+      - match userId to Party.partyId when available
+      - otherwise link to Case client Party as fallback
+    properties:
+      activityId: { type: string, source: _id, required: true }
+      category: { type: string, examples: [reminder, instruction, signing, case_info, status_change] }
+      action: { type: string, examples: [reminder_created, instruction_completed, user_signed] }
+      summary: { type: string, source: summary, note: "Timeline narrative" }
+      timestamp: { type: datetime, source: timestamp }
+      userId: { type: string, optional: true }
+      userName: { type: string, optional: true }
+      source: { type: string, optional: true }
+
+  INSURER_IN:
+    description: |
+      Insurer or national insurance body linked to a financial projection.
+      Sourced from projection.caseData.insuranceCompany.
+    from: Party
+    to: FinancialProjection
+    mongoSource:
+      collection: case_financial_projections
+      filter: { status: current }
+      partyFrom: projection.caseData.insuranceCompany
+      partyKind: organization
+      roleType: insurer
+    properties:
+      claimNumber: { type: string, source: projection.caseData.claimNumber, optional: true }
+      source: { type: string, default: projection }
+
+  EXPERT_IN:
+    description: |
+      Medical/legal expert referenced in the projection analysis.
+      Sourced from projection.caseData.experts.ours[] and experts.court[].
+    from: Party
+    to: FinancialProjection
+    mongoSource:
+      collection: case_financial_projections
+      filter: { status: current }
+      partyFrom: projection.caseData.experts
+      partyKind: person
+      roleType: expert
+    properties:
+      field: { type: string }
+      disability: { type: number, optional: true }
+      side: { type: enum, values: [ours, court] }
+      source: { type: string, default: projection }
+
+  LEGAL_TRACK:
+    description: |
+      Parallel legal track on a projection (e.g. National Insurance work-accident track).
+      Sourced from projection.caseStage.parallelTracks[].
+    from: Party
+    to: FinancialProjection
+    mongoSource:
+      collection: case_financial_projections
+      filter: { status: current }
+      tracksFrom: projection.caseStage.parallelTracks
+    properties:
+      trackType: { type: string }
+      currentStage: { type: string, optional: true }
+      currentStageHebrew: { type: string, optional: true }
+      stageNumber: { type: int, optional: true }
+      slaStatus: { type: string, optional: true }
+
+  SUBJECT_OF:
+    description: |
+      Client who is the subject of the financial projection analysis.
+      Links existing client Party to FinancialProjection via projection.clientName / case client.
+    from: Party
+    to: FinancialProjection
+    mongoSource:
+      collection: case_financial_projections
+      filter: { status: current }
+      matchClientParty: true
+    properties:
+      source: { type: string, default: projection }
+
+# ---------------------------------------------------------------------------
+# Removed from v1.0 (do not ingest as nodes)
+# ---------------------------------------------------------------------------
+deprecated_v1_0:
+  nodes:
+    - Communication
+    - ActivityEvent
+  edges:
+    - HAS_FILE
+    - HAS_COMMUNICATION
+    - HAS_ACTIVITY
+    - PERFORMED_BY
+    - REFERS_TO
+    - AUTHORED_BY
+  reason: |
+    Communication and document/activity events are modeled as dated edges.
+    activity_log category=communication duplicates communications collection.
+
+# ---------------------------------------------------------------------------
+# Ingest notes
+# ---------------------------------------------------------------------------
+ingestRules:
+  fileToCaseLink:
+    primary: RECEIVED_DOCUMENT
+    fallback: |
+      If a File exists without a matching document activity, optionally create
+      RECEIVED_DOCUMENT using files.uploadedAt/createdAt and empty summary,
+      or skip orphan files.
+  communicationActivityLog:
+    action: skip
+    reason: communications collection provides COMMUNICATED edges with full content
+  documentActivityLog:
+    linkVia: details.fileId
+    doNotUse: entityId
+    note: entityId is typically "file_" + details.fileId, not the Mongo _id alone
+  projectionParties:
+    insurerField: projection.caseData.insuranceCompany
+    expertFields: projection.caseData.experts.ours, projection.caseData.experts.court
+    parallelTracksField: projection.caseStage.parallelTracks
+    clientLinkField: projection.clientName
+    partyIdStrategy: normalized_name_hash
+    note: Insurer/expert parties are created at ingest from projection text fields
+
+# ---------------------------------------------------------------------------
+# v2 extensions
+# ---------------------------------------------------------------------------
+v2_edges:
+  SIMILAR_TO:
+    from: Case
+    to: Case
+    properties:
+      score: { type: float }
+      basis: { type: enum, values: [structured, semantic, hybrid] }
+
+# ---------------------------------------------------------------------------
+# Agent query patterns
+# ---------------------------------------------------------------------------
+agentUseCases:
+  - name: case_timeline
+    pattern: |
+      MATCH (c:Case)-[r:RECEIVED_DOCUMENT|COMMUNICATED|ACTIVITY]->()
+      RETURN type(r), r.timestamp, r.summary
+      ORDER BY r.timestamp
+    uses: edge.summary, edge.timestamp
+
+  - name: case_legal_story
+    pattern: (Case)-[:HAS_PROJECTION]->(FinancialProjection)
+    uses: FinancialProjection.caseSummary, legalStage, keyDates
+
+  - name: document_evidence
+    pattern: (Case)-[r:RECEIVED_DOCUMENT]->(File)
+    uses: File.summaryShort, File.documentType, r.timestamp, r.summary
+
+  - name: case_correspondence
+    pattern: (Case)-[r:COMMUNICATED]->(Party)
+    uses: r.type, r.direction, r.bodyPreview, r.sentAt
+
+  - name: projection_insurers_and_experts
+    pattern: |
+      MATCH (p:Party)-[r:INSURER_IN|EXPERT_IN|LEGAL_TRACK]->(fp:FinancialProjection)<-[:HAS_PROJECTION]-(c:Case)
+      RETURN c.caseId, p.name, p.roleType, type(r), r
+    uses: INSURER_IN.claimNumber, EXPERT_IN.field, EXPERT_IN.disability
+
+  - name: structured_similarity
+    pattern: Match Case / FinancialProjection on caseType, legalStage, estimatedCompensation
+    uses: structured node properties only
+
+  - name: injury_search
+    pattern: |
+      MATCH (c:Case)
+      OPTIONAL MATCH (c)-[:HAS_PROJECTION]->(p:FinancialProjection)
+      WHERE injurySearchText / mainInjury / injuredBodyParts / caseSummary matches query
+    uses: Case.mainInjury, Case.injuredBodyParts, Case.injurySearchText, FinancialProjection.caseSummary
+
+  - name: injury_compare
+    pattern: |
+      MATCH (c1:Case {caseId}), (c2:Case {caseId})
+      OPTIONAL MATCH (c)-[:HAS_PROJECTION]->(p:FinancialProjection)
+    uses: Case injury fields + outcomeBand + compensationMax for side-by-side comparison

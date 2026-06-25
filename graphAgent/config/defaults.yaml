@@ -1,0 +1,19 @@
+limits:
+  max_outer_iterations: 2
+  max_tool_calls: 10
+  max_react_steps: 8
+  max_search_retries: 2
+  max_empty_streak: 2
+  timeout_seconds: 90
+
+outcomes:
+  success_compensation_percentile: 75
+  partial_compensation_percentile: 40
+
+pricing:
+  default:
+    input_per_million_usd: 3.0
+    output_per_million_usd: 15.0
+  claude-sonnet-4-6:
+    input_per_million_usd: 3.0
+    output_per_million_usd: 15.0

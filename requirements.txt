@@ -1,0 +1,7 @@
+# Full stack (ingest + agent + optional analyzeData exploration)
+-r graphIngest/requirements.txt
+-r graphAgent/requirements.txt
+-r analyzeData/requirements.txt
+
+# Root-level API smoke test
+anthropic>=0.40

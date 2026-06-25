@@ -1,0 +1,4 @@
+pymongo>=4.10
+python-dotenv>=1.0
+neo4j>=5.28
+PyYAML>=6.0
