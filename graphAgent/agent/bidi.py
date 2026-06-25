@@ -4,19 +4,41 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 from pathlib import Path
 
-# Unicode directional isolates (Unicode BiDi algorithm)
-RLI = "\u2067"  # Right-to-Left Isolate
-LRI = "\u2066"  # Left-to-Right Isolate
-PDI = "\u2069"  # Pop Directional Isolate
+# Unicode directional controls (strip from HTML; optional for terminal)
+BIDI_CONTROLS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+RLI = "\u2067"
+LRI = "\u2066"
+PDI = "\u2069"
 
 HEBREW_CHAR = re.compile(r"[\u0590-\u05FF\uFB1D-\uFB4F]")
 LATIN_RUN = re.compile(r"[A-Za-z0-9_`.\-/\\|:]+")
+# Latin/code spans to embed inside RTL paragraphs (caseId, tool names, numbers)
+LTR_EMBED = re.compile(
+    r"`[^`]+`|"  # backtick code
+    r"caseId:\s*`[^`]+`|"  # caseId: `...`
+    r"\b[A-Za-z][A-Za-z0-9_]{2,}\b|"  # identifiers / snake_case
+    r"₪[\d,]+|"  # shekel amounts
+    r"\b\d[\d,.\s]*\d\b"  # numbers
+)
 
 
 def contains_hebrew(text: str) -> bool:
     return bool(HEBREW_CHAR.search(text or ""))
+
+
+def hebrew_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    hebrew = len(HEBREW_CHAR.findall(text))
+    letters = sum(1 for char in text if char.isalpha() or _is_hebrew_char(char))
+    return hebrew / letters if letters else 0.0
+
+
+def strip_bidi_controls(text: str) -> str:
+    return BIDI_CONTROLS.sub("", text or "")
 
 
 def _is_hebrew_char(char: str) -> bool:
@@ -25,6 +47,7 @@ def _is_hebrew_char(char: str) -> bool:
 
 def improve_terminal_bidi(text: str) -> str:
     """Wrap Hebrew and Latin runs so terminals with BiDi support display more naturally."""
+    text = strip_bidi_controls(text)
     if not text or not contains_hebrew(text):
         return text
     return "\n".join(_bidi_line(line) for line in text.splitlines())
@@ -74,6 +97,71 @@ def _bidi_line(line: str) -> str:
     return "".join(parts)
 
 
+def _inline_format(line: str) -> str:
+    """Minimal inline markdown → HTML with LTR embeds for Latin/code inside RTL."""
+    escaped = html.escape(line)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    if contains_hebrew(line):
+        escaped = LTR_EMBED.sub(r'<span dir="ltr" class="ltr-embed">\g<0></span>', escaped)
+    return escaped
+
+
+def render_answer_html(answer: str) -> str:
+    """Convert agent markdown-ish answer to HTML with explicit RTL for Hebrew."""
+    answer = strip_bidi_controls(answer or "")
+    if not answer.strip():
+        return "<p>(empty answer)</p>"
+
+    rtl = hebrew_ratio(answer) >= 0.15
+    blocks: list[str] = []
+    list_items: list[str] = []
+
+    def flush_list() -> None:
+        nonlocal list_items
+        if not list_items:
+            return
+        dir_attr = ' dir="rtl"' if rtl else ""
+        blocks.append(f"<ul{dir_attr}>" + "".join(list_items) + "</ul>")
+        list_items = []
+
+    for raw_line in answer.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            flush_list()
+            continue
+        if line.strip() == "---":
+            flush_list()
+            blocks.append("<hr>")
+            continue
+        if line.startswith("### "):
+            flush_list()
+            blocks.append(f"<h3>{_inline_format(line[4:])}</h3>")
+            continue
+        if line.startswith("## "):
+            flush_list()
+            blocks.append(f"<h2>{_inline_format(line[3:])}</h2>")
+            continue
+        if line.startswith("# "):
+            flush_list()
+            blocks.append(f"<h1>{_inline_format(line[2:])}</h1>")
+            continue
+        if line.startswith("> "):
+            flush_list()
+            dir_attr = ' dir="rtl"' if rtl else ""
+            blocks.append(f'<blockquote{dir_attr}>{_inline_format(line[2:])}</blockquote>')
+            continue
+        if line.startswith("- ") or line.startswith("* "):
+            list_items.append(f"<li>{_inline_format(line[2:])}</li>")
+            continue
+        flush_list()
+        dir_attr = ' dir="rtl"' if rtl else ""
+        blocks.append(f"<p{dir_attr}>{_inline_format(line)}</p>")
+
+    flush_list()
+    return "\n".join(blocks)
+
+
 def write_html_answer_report(
     path: Path,
     *,
@@ -81,23 +169,34 @@ def write_html_answer_report(
     answer: str,
     metadata: dict,
 ) -> Path:
-    """Write an RTL-friendly HTML view of the answer (best Hebrew rendering)."""
+    """Write an RTL-friendly HTML view of the answer."""
+    answer = strip_bidi_controls(answer or "")
+    question = strip_bidi_controls(question or "")
+    rtl = hebrew_ratio(answer) >= 0.15 or hebrew_ratio(question) >= 0.15
+    html_dir = ' dir="rtl"' if rtl else ""
+    lang = "he" if rtl else "en"
+
     meta_rows = "".join(
-        f"<tr><th>{html.escape(str(key))}</th><td>{html.escape(str(value))}</td></tr>"
+        f"<tr><th>{html.escape(str(key))}</th><td dir=\"ltr\">{html.escape(str(value))}</td></tr>"
         for key, value in metadata.items()
     )
+
+    question_html = _inline_format(question)
+    answer_html = render_answer_html(answer)
+
     document = f"""<!DOCTYPE html>
-<html lang="he">
+<html lang="{lang}"{html_dir}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Agent answer</title>
   <style>
     body {{
-      font-family: "Segoe UI", Arial, sans-serif;
+      font-family: "Segoe UI", "Rubik", "Arial Hebrew", Arial, sans-serif;
       margin: 2rem;
       background: #fafafa;
       color: #111;
+      line-height: 1.6;
     }}
     .card {{
       background: #fff;
@@ -107,26 +206,42 @@ def write_html_answer_report(
       max-width: 960px;
       box-shadow: 0 1px 3px rgba(0,0,0,.06);
     }}
-    h1 {{ font-size: 1.2rem; margin-top: 0; }}
+    h1.page-title {{ font-size: 1.2rem; margin-top: 0; }}
     .question {{
-      unicode-bidi: plaintext;
-      white-space: pre-wrap;
       background: #f3f4f6;
       padding: 0.75rem 1rem;
       border-radius: 6px;
       margin-bottom: 1rem;
     }}
-    .answer {{
-      unicode-bidi: plaintext;
-      white-space: pre-wrap;
-      line-height: 1.6;
-      font-size: 1rem;
+    .answer h1, .answer h2, .answer h3 {{ margin: 1rem 0 0.5rem; }}
+    .answer p, .answer li, .answer blockquote {{ margin: 0.4rem 0; }}
+    .answer ul {{ padding-right: 1.25rem; padding-left: 0; }}
+    .answer blockquote {{
+      border-right: 3px solid #ccc;
+      border-left: none;
+      margin-right: 0;
+      padding-right: 0.75rem;
+      color: #444;
+    }}
+    code {{
+      background: #f3f4f6;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace;
+      direction: ltr;
+      unicode-bidi: embed;
+    }}
+    .ltr-embed {{
+      direction: ltr;
+      unicode-bidi: embed;
+      display: inline-block;
     }}
     table {{
       width: 100%;
       border-collapse: collapse;
       margin-top: 1.5rem;
       font-size: 0.9rem;
+      direction: ltr;
     }}
     th, td {{
       border-top: 1px solid #eee;
@@ -137,15 +252,34 @@ def write_html_answer_report(
     th {{ width: 180px; color: #555; }}
   </style>
 </head>
-<body>
+<body{html_dir}>
   <div class="card">
-    <h1>Graph agent answer</h1>
-    <div class="question">{html.escape(question)}</div>
-    <div class="answer">{html.escape(answer or "")}</div>
+    <h1 class="page-title">Graph agent answer</h1>
+    <div class="question"{html_dir}>{question_html}</div>
+    <div class="answer"{html_dir}>
+{answer_html}
+    </div>
     <table>{meta_rows}</table>
   </div>
 </body>
 </html>
 """
-    path.write_text(document, encoding="utf-8")
+    path.write_text(document, encoding="utf-8-sig")
     return path
+
+
+def open_html_in_browser(path: Path) -> None:
+    """Open HTML report in the default browser (Windows-friendly)."""
+    resolved = path.resolve()
+    uri = resolved.as_uri()
+    try:
+        if sys.platform == "win32":
+            import os
+
+            os.startfile(str(resolved))  # noqa: S606 — intentional on Windows
+            return
+    except OSError:
+        pass
+    import webbrowser
+
+    webbrowser.open(uri)

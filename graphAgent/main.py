@@ -17,7 +17,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from agent.graph import build_agent_graph
-from agent.bidi import improve_terminal_bidi, write_html_answer_report
+from agent.bidi import improve_terminal_bidi, open_html_in_browser, write_html_answer_report
 from agent.progress import log_progress, log_step, reset_progress, set_verbose
 from agent.usage import format_usage_summary
 from clients.mongo_client import MongoReadClient
@@ -38,7 +38,12 @@ def main() -> None:
     parser.add_argument(
         "--html",
         action="store_true",
-        help="Also write an RTL-friendly HTML answer report under graphAgent/output/",
+        help="Write an RTL-friendly HTML answer report under graphAgent/output/",
+    )
+    parser.add_argument(
+        "--open-html",
+        action="store_true",
+        help="Open the HTML report in your default browser (use with --html)",
     )
     parser.add_argument(
         "--no-bidi",
@@ -132,11 +137,17 @@ def main() -> None:
         )
         if not args.quiet:
             log_progress(f"HTML answer report: {html_path}")
+        if args.open_html:
+            open_html_in_browser(html_path)
+            if not args.quiet:
+                log_progress("Opened HTML report in default browser")
 
     print(answer_text)
     print()
     print(format_usage_summary(token_usage))
     suffix = f" | HTML: {html_path}" if html_path else ""
+    if html_path:
+        suffix += " (open in Chrome/Edge with --open-html)"
     print(
         f"Sufficient: {report['sufficient']} | Tool calls: {report['toolCallCount']} | Report: {report_path}{suffix}"
     )

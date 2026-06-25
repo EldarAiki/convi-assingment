@@ -255,26 +255,28 @@ def build_neo4j_tools(neo4j: Neo4jReadClient, mongo: MongoReadClient | None = No
         return json.dumps({"found": True, **payload}, ensure_ascii=False)
 
     def get_case_timeline(case_id: str) -> str:
+        # Aggregate each edge type separately to avoid cartesian explosion
+        # (multiple OPTIONAL MATCH + collect in one row blows up memory on busy cases).
         cypher = """
         MATCH (c:Case {caseId: $caseId})
         OPTIONAL MATCH (c)-[rd:RECEIVED_DOCUMENT]->(f:File)
-        OPTIONAL MATCH (c)-[cm:COMMUNICATED]->(cp:Party)
-        OPTIONAL MATCH (c)-[ac:ACTIVITY]->(ap:Party)
-        WITH collect({
+        WITH c, collect({
             kind: 'document',
             at: rd.timestamp,
             summary: coalesce(rd.summary, f.summaryShort),
             detail: f.fileName,
             id: rd.activityId
-        }) AS docs,
-        collect({
+        }) AS docs
+        OPTIONAL MATCH (c)-[cm:COMMUNICATED]->(cp:Party)
+        WITH c, docs, collect({
             kind: 'communication',
             at: cm.sentAt,
             summary: cm.bodyPreview,
             detail: cm.type + ' / ' + coalesce(cm.direction, ''),
             id: cm.communicationId
-        }) AS comms,
-        collect({
+        }) AS comms
+        OPTIONAL MATCH (c)-[ac:ACTIVITY]->(ap:Party)
+        WITH docs, comms, collect({
             kind: 'activity',
             at: ac.timestamp,
             summary: ac.summary,

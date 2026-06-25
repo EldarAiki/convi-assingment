@@ -37,6 +37,14 @@ Desktop is optional and useful for visual graph exploration.
 
 Single env file at repo root: **`.env`** (see [`.env.example`](.env.example)).
 
+## Design documentation
+
+Architecture rationale and thought process: [`thoughtProcessDocumentation/`](thoughtProcessDocumentation/)
+
+- [Graph schema design](thoughtProcessDocumentation/graph-schema-design.md) — nodes vs edges, properties, tradeoffs  
+- [Agent architecture](thoughtProcessDocumentation/agent-architecture.md) — LangGraph, tools, guardrails  
+- [Project journey](thoughtProcessDocumentation/project-journey-and-tradeoffs.md) — pipeline phases, Mongo vs Neo4j, v2 roadmap  
+
 ## License / data
 
 MongoDB credentials are assessment-specific and not included in this repo. Neo4j data is built locally via ingest.
