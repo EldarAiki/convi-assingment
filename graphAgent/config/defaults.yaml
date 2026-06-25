@@ -6,6 +6,11 @@ limits:
   max_empty_streak: 2
   timeout_seconds: 90
 
+logging:
+  show_reasoning: true
+  reasoning_max_lines: 12
+  reasoning_max_chars: 900
+
 outcomes:
   success_compensation_percentile: 75
   partial_compensation_percentile: 40

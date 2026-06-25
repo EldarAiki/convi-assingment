@@ -9,11 +9,30 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from agent.progress import log_progress, log_step
+from agent.progress import log_progress, log_reasoning, log_step
 from agent.prompts.system import INSUFFICIENT_PROMPT, SYNTHESIZE_PROMPT, SYSTEM_PROMPT
 from agent.state import AgentState
 from agent.usage import extract_message_usage, merge_usage
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, load_defaults
+
+
+def _block_text(block) -> str:
+    if isinstance(block, dict):
+        kind = block.get("type")
+        if kind in ("text", "output_text"):
+            return (block.get("text") or "").strip()
+        if kind in ("thinking", "reasoning"):
+            return (block.get("thinking") or block.get("reasoning") or "").strip()
+    kind = getattr(block, "type", None)
+    if kind in ("text", "output_text"):
+        return (getattr(block, "text", None) or "").strip()
+    if kind in ("thinking", "reasoning"):
+        return (
+            getattr(block, "thinking", None)
+            or getattr(block, "reasoning", None)
+            or ""
+        ).strip()
+    return ""
 
 
 def _extract_text(content) -> str:
@@ -21,12 +40,41 @@ def _extract_text(content) -> str:
         return content
     if isinstance(content, list):
         parts = [
-            part.get("text", "")
+            _block_text(part)
             for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
+            if _block_text(part)
         ]
         return "\n".join(parts)
     return str(content)
+
+
+def _extract_reasoning(message: AIMessage) -> str:
+    """Text and thinking blocks already returned by the model (no extra LLM call)."""
+    parts: list[str] = []
+
+    content_blocks = getattr(message, "content_blocks", None)
+    if content_blocks:
+        for block in content_blocks:
+            text = _block_text(block)
+            if text:
+                parts.append(text)
+
+    if not parts:
+        content = message.content
+        if isinstance(content, str) and content.strip():
+            parts.append(content.strip())
+        elif isinstance(content, list):
+            for block in content:
+                text = _block_text(block)
+                if text:
+                    parts.append(text)
+
+    # Preserve order but drop duplicate consecutive snippets.
+    deduped: list[str] = []
+    for part in parts:
+        if not deduped or deduped[-1] != part:
+            deduped.append(part)
+    return "\n\n".join(deduped)
 
 
 def _is_empty_tool_result(content: str) -> bool:
@@ -63,9 +111,14 @@ def _summarize_tool_result(tool_name: str, content: str) -> str:
 
 
 def build_agent_graph(tools: list):
-    limits = load_defaults().get("limits", {})
+    defaults = load_defaults()
+    limits = defaults.get("limits", {})
+    logging_cfg = defaults.get("logging", {})
     max_tool_calls = int(limits.get("max_tool_calls", 10))
     max_empty_streak = int(limits.get("max_empty_streak", 2))
+    show_reasoning = bool(logging_cfg.get("show_reasoning", True))
+    reasoning_max_lines = int(logging_cfg.get("reasoning_max_lines", 12))
+    reasoning_max_chars = int(logging_cfg.get("reasoning_max_chars", 900))
 
     llm = ChatAnthropic(
         model=ANTHROPIC_MODEL,
@@ -106,6 +159,15 @@ def build_agent_graph(tools: list):
         log_step("Thinking — planning tool use or final response")
         response = llm_with_tools.invoke(state["messages"])
         token_usage = merge_usage(state.get("token_usage"), extract_message_usage(response))
+
+        if show_reasoning:
+            reasoning = _extract_reasoning(response)
+            if reasoning:
+                log_reasoning(
+                    reasoning,
+                    max_lines=reasoning_max_lines,
+                    max_chars=reasoning_max_chars,
+                )
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if tool_calls:

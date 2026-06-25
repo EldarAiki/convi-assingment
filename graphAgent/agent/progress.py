@@ -30,3 +30,26 @@ def log_step(message: str) -> None:
     global _step
     _step += 1
     log_progress(f"[{_step}] {message}")
+
+
+def log_reasoning(
+    text: str,
+    *,
+    max_lines: int = 12,
+    max_chars: int = 900,
+) -> None:
+    """Print model reasoning/planning text already returned in the AIMessage."""
+    if not _verbose:
+        return
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 3].rstrip() + "..."
+    lines = cleaned.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["..."]
+    log_progress("  Reasoning:")
+    for line in lines:
+        if line.strip():
+            log_progress(f"    {line.rstrip()}")

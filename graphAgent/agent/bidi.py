@@ -23,6 +23,7 @@ LTR_EMBED = re.compile(
     r"₪[\d,]+|"  # shekel amounts
     r"\b\d[\d,.\s]*\d\b"  # numbers
 )
+_HTML_TAG = re.compile(r"(<[^>]+>)")
 
 
 def contains_hebrew(text: str) -> bool:
@@ -97,13 +98,27 @@ def _bidi_line(line: str) -> str:
     return "".join(parts)
 
 
+def _embed_ltr_spans(text: str) -> str:
+    """Wrap Latin/code runs in LTR spans without touching HTML tag names."""
+    parts = _HTML_TAG.split(text)
+    out: list[str] = []
+    for index, part in enumerate(parts):
+        if index % 2 == 1:
+            out.append(part)
+        else:
+            out.append(
+                LTR_EMBED.sub(r'<span dir="ltr" class="ltr-embed">\g<0></span>', part)
+            )
+    return "".join(out)
+
+
 def _inline_format(line: str) -> str:
     """Minimal inline markdown → HTML with LTR embeds for Latin/code inside RTL."""
     escaped = html.escape(line)
     escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
     escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
     if contains_hebrew(line):
-        escaped = LTR_EMBED.sub(r'<span dir="ltr" class="ltr-embed">\g<0></span>', escaped)
+        escaped = _embed_ltr_spans(escaped)
     return escaped
 
 
